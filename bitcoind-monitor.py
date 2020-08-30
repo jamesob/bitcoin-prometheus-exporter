@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import asyncio
 import json
 import logging
 import time
@@ -8,15 +9,19 @@ import os
 import signal
 import sys
 import socket
+from asyncio import ensure_future, Future
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import lru_cache
-from typing import Any
+from queue import Queue
+from typing import Any, Tuple, Optional, Callable, Set, Iterable
 from typing import Dict
 from typing import List
 from typing import Union
 from urllib.parse import quote
 
+import bitcoin
 import riprova
 
 from bitcoin.rpc import InWarmupError, Proxy
@@ -119,19 +124,31 @@ REFRESH_SECONDS = float(os.environ.get("REFRESH_SECONDS", "300"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "8334"))
 RETRIES = int(os.environ.get("RETRIES", 5))
 TIMEOUT = int(os.environ.get("TIMEOUT", 30))
+NUM_THREADS = int(os.environ.get("NUM_THREADS", 5))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 
 RETRY_EXCEPTIONS = (InWarmupError, ConnectionError, socket.timeout)
 
+# TODO: Update RpcResult to be more accurate
 RpcResult = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
+RpcCall = Tuple[Any, ...]
+RpcCallback = Callable[[RpcResult], None]
+RpcCallError = Tuple[RpcCall, BaseException]
+MetricDefinition = Tuple[RpcCall, List[RpcCallback]]
+MetricCollection = List[MetricDefinition]
+
+
+def exception_count(e: BaseException) -> None:
+    err_type = type(e)
+    exception_name = err_type.__module__ + "." + err_type.__name__
+    EXPORTER_ERRORS.labels(**{"type": exception_name}).inc()
 
 
 def on_retry(err: Exception, next_try: float) -> None:
-    err_type = type(err)
-    exception_name = err_type.__module__ + "." + err_type.__name__
-    EXPORTER_ERRORS.labels(**{"type": exception_name}).inc()
-    logger.error("Retry after exception %s: %s", exception_name, err)
+    # Count all exceptions, even those that will be retried.
+    exception_count(err)
+    logger.debug("Retry after exception: %s", err)
 
 
 def error_evaluator(e: Exception) -> bool:
@@ -176,23 +193,22 @@ def rpc_client():
 def bitcoinrpc(*args) -> RpcResult:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("RPC call: " + " ".join(str(a) for a in args))
-
-    result = rpc_client().call(*args)
-
-    logger.debug("Result:   %s", result)
-    return result
+    rpc_result = rpc_client().call(*args)
+    return rpc_result
 
 
-def get_block(block_hash: str):
+def get_block(block_hash: str) -> Optional[RpcResult]:
     try:
-        block = bitcoinrpc("getblock", block_hash, 2)
+        return bitcoinrpc("getblock", block_hash, 2)
     except Exception:
         logger.exception("Failed to retrieve block " + block_hash + " from bitcoind.")
         return None
-    return block
 
 
 def smartfee_gauge(num_blocks: int) -> Gauge:
+    """
+    Returns the Prometheus gauge for the smart fee associated with a given number of blocks.
+    """
     gauge = BITCOIN_ESTIMATED_SMART_FEE_GAUGES.get(num_blocks)
     if gauge is None:
         gauge = Gauge(
@@ -203,43 +219,44 @@ def smartfee_gauge(num_blocks: int) -> Gauge:
     return gauge
 
 
-def do_smartfee(num_blocks: int) -> None:
-    smartfee = bitcoinrpc("estimatesmartfee", num_blocks).get("feerate")
-    if smartfee is not None:
-        gauge = smartfee_gauge(num_blocks)
-        gauge.set(smartfee)
+#
+# Callback functions associated with specific RPC calls. See "build_metric_collection" for usage.
+#
 
 
-def refresh_metrics() -> None:
-    uptime = int(bitcoinrpc("uptime"))
-    meminfo = bitcoinrpc("getmemoryinfo", "stats")["locked"]
-    blockchaininfo = bitcoinrpc("getblockchaininfo")
-    networkinfo = bitcoinrpc("getnetworkinfo")
-    chaintips = len(bitcoinrpc("getchaintips"))
-    mempool = bitcoinrpc("getmempoolinfo")
-    nettotals = bitcoinrpc("getnettotals")
-    latest_block = get_block(str(blockchaininfo["bestblockhash"]))
-    hashps_120 = float(bitcoinrpc("getnetworkhashps", 120))  # 120 is the default
-    hashps_neg1 = float(bitcoinrpc("getnetworkhashps", -1))
-    hashps_1 = float(bitcoinrpc("getnetworkhashps", 1))
+def set_meminfo_metrics(result: RpcResult) -> None:
+    meminfo: Dict[str, float] = result["locked"]  # type: ignore
+    BITCOIN_MEMINFO_USED.set(meminfo["used"])
+    BITCOIN_MEMINFO_FREE.set(meminfo["free"])
+    BITCOIN_MEMINFO_TOTAL.set(meminfo["total"])
+    BITCOIN_MEMINFO_LOCKED.set(meminfo["locked"])
+    BITCOIN_MEMINFO_CHUNKS_USED.set(meminfo["chunks_used"])
+    BITCOIN_MEMINFO_CHUNKS_FREE.set(meminfo["chunks_free"])
 
-    banned = bitcoinrpc("listbanned")
 
-    BITCOIN_UPTIME.set(uptime)
+def set_mempool_metrics(result: RpcResult) -> None:
+    mempool: Dict[str, float] = result  # type: ignore
+    BITCOIN_MEMPOOL_BYTES.set(mempool["bytes"])
+    BITCOIN_MEMPOOL_SIZE.set(mempool["size"])
+    BITCOIN_MEMPOOL_USAGE.set(mempool["usage"])
+
+
+def set_blockchaininfo_metrics(result: RpcResult) -> None:
+    blockchaininfo: Dict[str, float] = result  # type: ignore
     BITCOIN_BLOCKS.set(blockchaininfo["blocks"])
-    BITCOIN_PEERS.set(networkinfo["connections"])
     BITCOIN_DIFFICULTY.set(blockchaininfo["difficulty"])
-    BITCOIN_HASHPS.set(hashps_120)
-    BITCOIN_HASHPS_NEG1.set(hashps_neg1)
-    BITCOIN_HASHPS_1.set(hashps_1)
-    BITCOIN_SERVER_VERSION.set(networkinfo["version"])
-    BITCOIN_PROTOCOL_VERSION.set(networkinfo["protocolversion"])
     BITCOIN_SIZE_ON_DISK.set(blockchaininfo["size_on_disk"])
     BITCOIN_VERIFICATION_PROGRESS.set(blockchaininfo["verificationprogress"])
 
-    for smartfee in SMART_FEES:
-        do_smartfee(smartfee)
 
+def set_nettotals_metrics(result: RpcResult) -> None:
+    nettotals: Dict[str, float] = result  # type: ignore
+    BITCOIN_TOTAL_BYTES_RECV.set(nettotals["totalbytesrecv"])
+    BITCOIN_TOTAL_BYTES_SENT.set(nettotals["totalbytessent"])
+
+
+def set_banned(result: RpcResult) -> None:
+    banned: List[Dict[str, Any]] = result  # type: ignore
     for ban in banned:
         BITCOIN_BAN_CREATED.labels(address=ban["address"], reason=ban["ban_reason"]).set(
             ban["ban_created"]
@@ -248,25 +265,19 @@ def refresh_metrics() -> None:
             ban["banned_until"]
         )
 
+
+def set_networkinfo(result: RpcResult) -> None:
+    networkinfo: Dict[str, float] = result  # type: ignore
+    BITCOIN_PEERS.set(networkinfo["connections"])
+    BITCOIN_SERVER_VERSION.set(networkinfo["version"])
+    BITCOIN_PROTOCOL_VERSION.set(networkinfo["protocolversion"])
     if networkinfo["warnings"]:
         BITCOIN_WARNINGS.inc()
 
-    BITCOIN_NUM_CHAINTIPS.set(chaintips)
 
-    BITCOIN_MEMINFO_USED.set(meminfo["used"])
-    BITCOIN_MEMINFO_FREE.set(meminfo["free"])
-    BITCOIN_MEMINFO_TOTAL.set(meminfo["total"])
-    BITCOIN_MEMINFO_LOCKED.set(meminfo["locked"])
-    BITCOIN_MEMINFO_CHUNKS_USED.set(meminfo["chunks_used"])
-    BITCOIN_MEMINFO_CHUNKS_FREE.set(meminfo["chunks_free"])
-
-    BITCOIN_MEMPOOL_BYTES.set(mempool["bytes"])
-    BITCOIN_MEMPOOL_SIZE.set(mempool["size"])
-    BITCOIN_MEMPOOL_USAGE.set(mempool["usage"])
-
-    BITCOIN_TOTAL_BYTES_RECV.set(nettotals["totalbytesrecv"])
-    BITCOIN_TOTAL_BYTES_SENT.set(nettotals["totalbytessent"])
-
+def set_latest_block_metrics(result: RpcResult) -> None:
+    blockchaininfo: Dict[str, Any] = result  # type: ignore
+    latest_block: Dict[str, Any] = get_block(str(blockchaininfo["bestblockhash"]))  # type: ignore
     if latest_block is not None:
         BITCOIN_LATEST_BLOCK_SIZE.set(latest_block["size"])
         BITCOIN_LATEST_BLOCK_TXS.set(latest_block["nTx"])
@@ -286,18 +297,238 @@ def refresh_metrics() -> None:
         BITCOIN_LATEST_BLOCK_VALUE.set(value)
 
 
-def sigterm_handler(signal, frame) -> None:
-    logger.critical("Received SIGTERM. Exiting.")
-    sys.exit(0)
+def set_uptime(uptime: RpcResult):
+    BITCOIN_UPTIME.set(int(uptime))  # type: ignore
 
 
-def exception_count(e: Exception) -> None:
-    err_type = type(e)
-    exception_name = err_type.__module__ + "." + err_type.__name__
-    EXPORTER_ERRORS.labels(**{"type": exception_name}).inc()
+def set_chaintips(chaintips: RpcResult):
+    BITCOIN_NUM_CHAINTIPS.set(len(chaintips))  # type: ignore
 
 
-def main():
+#
+# Factory methods for certain callbacks.
+#
+
+
+def make_set_hashps(metric: Gauge) -> RpcCallback:
+    def set_hashps(hashps: RpcResult) -> None:
+        metric.set(float(hashps))  # type: ignore
+
+    return set_hashps
+
+
+def make_set_smartfee(num_blocks: int) -> RpcCallback:
+    def set_smartfee(smartfee: RpcResult) -> None:
+        fee = smartfee.get("feerate")  # type: ignore
+        if fee is not None:
+            smartfee_gauge(num_blocks).set(fee)
+
+    return set_smartfee
+
+
+def build_metric_collection() -> MetricCollection:
+    """
+    Builds the collection of metrics, which is defined as a
+    """
+    calls: MetricCollection = [
+        (("uptime",), [set_uptime]),
+        (("getmemoryinfo", "stats"), [set_meminfo_metrics]),
+        (("getblockchaininfo",), [set_blockchaininfo_metrics, set_latest_block_metrics]),
+        (("getnetworkinfo",), [set_networkinfo]),
+        (("getchaintips",), [set_chaintips]),
+        (("getmempoolinfo",), [set_mempool_metrics]),
+        (("getnettotals",), [set_nettotals_metrics]),
+        (("getnetworkhashps", 120), [make_set_hashps(BITCOIN_HASHPS)]),
+        (("getnetworkhashps", -1), [make_set_hashps(BITCOIN_HASHPS_NEG1)]),
+        (("getnetworkhashps", 1), [make_set_hashps(BITCOIN_HASHPS_1)]),
+        (("listbanned",), [set_banned]),
+    ]
+
+    # Add the dynamic smart fee metrics.
+    for num_blocks in SMART_FEES:
+        smartfee_metric = (("estimatesmartfee", num_blocks), [make_set_smartfee(num_blocks)])
+        calls.append(smartfee_metric)
+
+    return calls
+
+
+def add_task_error_collector(errors: Queue, task: Future, call: RpcCall) -> None:
+    def collect_error(completed_task: Future) -> None:
+        exception = completed_task.exception()
+        if exception is not None:
+            exception_count(exception)
+            errors.put_nowait((call, exception))
+
+    task.add_done_callback(collect_error)
+
+
+class MetricState:
+    """
+    Tracks the state of certain RPC calls and whether they should be enabled or not.
+    """
+
+    def __init__(self) -> None:
+        self.disabled: Set[RpcCall] = set()
+
+    def is_enabled(self, call: RpcCall) -> bool:
+        return call not in self.disabled
+
+    def disable_until_complete(self, task: Future, call: RpcCall) -> None:
+        # Don't disable if it's already done.
+        if task.done():
+            return
+
+        self.disabled.add(call)
+
+        def enable_call(task):
+            if call in self.disabled:
+                self.disabled.remove(call)
+
+        task.add_done_callback(enable_call)
+
+
+class MetricRunner:
+    """
+    Runs all the metrics asynchronously in a ThreadPoolExecutor.
+    """
+
+    # Ignore all the main riprova exceptions and exceptions thrown from the callback functions.
+    IGNORABLE_EXCEPTIONS = (riprova.exceptions.RetryError,)
+
+    def __init__(self, metrics: MetricCollection, num_threads: int) -> None:
+        self.metrics = metrics
+        self.state = MetricState()
+        self.error_queue: "Queue[RpcCallError]" = Queue()
+
+        logger.info("Starting thread pool with %s threads", num_threads)
+        self._executor = ThreadPoolExecutor(num_threads)
+
+    async def refresh_all(self, timeout: Optional[float]) -> None:
+        """
+        Runs all metrics simultaneously, keeping the overall runtime of this method under the
+        timeout value.
+
+        Metrics that do not complete their execution in the timeout duration will be disabled on
+        subsequent calls to this method until they complete.
+
+        Args:
+            timeout: Number of seconds to wait for results.
+        """
+        # Start the async tasks all together.
+        loop = asyncio.get_event_loop()
+        tasks = []
+        waiting = []
+        for call, callbacks in self.metrics:
+            if not self.state.is_enabled(call):
+                waiting.append(call)
+                continue
+            task = loop.run_in_executor(self._executor, run_rpc_call, call, callbacks)
+            tasks.append(task)
+            task_future = ensure_future(task)
+            self.state.disable_until_complete(task_future, call)
+            add_task_error_collector(self.error_queue, task_future, call)
+
+        if waiting:
+            waiting_calls = [" ".join(str(a) for a in call) for call in waiting]
+            logger.warning("Waiting on these calls: %s", waiting_calls)
+
+        if not tasks:
+            logger.warning("No tasks started. Still waiting on past tasks.")
+            return
+
+        if timeout:
+            logger.debug("%s tasks created, starting wait for %s seconds", len(tasks), timeout)
+        else:
+            logger.debug("%s tasks created, waiting for completion")
+
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+
+        if pending:
+            logger.info("Waiting on %s tasks", len(pending))
+
+        # Log and re-raise exceptions for the main method to handle.
+        # NOTE: This only throws the first bad exception of potentially many.
+        while not self.error_queue.empty():
+            call, exception = self.error_queue.get()
+            if not isinstance(exception, self.IGNORABLE_EXCEPTIONS):
+                logger.error("Error running call [%s]: %s", call, exception)
+                raise exception
+
+    def close(self, wait: bool = True) -> None:
+        self._executor.shutdown(wait=wait)
+
+
+def run_rpc_call(call: RpcCall, callbacks: Iterable[RpcCallback]) -> None:
+    """
+    Perform an RPC call and call the relevant callbacks.
+    """
+    start = datetime.now()
+    result = bitcoinrpc(*call)
+
+    # Try our best to call all actions and avoid throwing errors.
+    for callback in callbacks:
+        try:
+            callback(result)
+        except Exception as ex:
+            logger.exception("Ignoring error in callback: %s", call)
+            exception_count(ex)
+
+    end = datetime.now()
+    duration = (end - start).total_seconds()
+    logger.debug("RPC and callbacks [took %s sec]: %s", duration, call)
+
+
+def create_cleanup_signal_handler(metric_runner: MetricRunner):
+    def signal_handler(signal, frame) -> None:
+        logger.critical("Received SIGTERM/SIGINT. Exiting.")
+        metric_runner.close(wait=False)
+        logging.shutdown()
+        sys.exit(0)
+
+    return signal_handler
+
+
+async def main():
+    # Start up the server to expose the metrics.
+    start_http_server(METRICS_PORT)
+
+    # Create the metric callbacks and runner.
+    metrics = build_metric_collection()
+    metric_runner = MetricRunner(metrics, NUM_THREADS)
+
+    # Handle SIGTERM gracefully.
+    signal_handler = create_cleanup_signal_handler(metric_runner)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    while True:
+        process_start = datetime.now()
+
+        # Allow unknown exceptions to crash the process, but try to give better error messages for
+        # certain known failures.
+        #
+        # See MetricRunner.IGNORABLE_EXCEPTIONS for a list of ignored exceptions on RPC calls.
+        try:
+            await metric_runner.refresh_all(timeout=TIMEOUT)
+        except (json.decoder.JSONDecodeError, bitcoin.rpc.JSONRPCError) as e:
+            # Definitely happens on bad RPC credentials.
+            logger.error("RPC call did not return JSON. Bad credentials? " + str(e))
+            sys.exit(1)
+        except ValueError as e:
+            # The Proxy class throws ValueError when credentials and cookie are missing.
+            logger.error("Unhandled error: %s", e)
+            sys.exit(2)
+
+        # Track the duration of the refreshes as a metric.
+        duration = (datetime.now() - process_start).total_seconds()
+        PROCESS_TIME.inc(duration)
+        remaining = max(REFRESH_SECONDS - duration, 0)
+
+        logger.info("Refresh took %.1f seconds, sleeping for %.1f seconds", duration, remaining)
+        await asyncio.sleep(remaining)
+
+
+if __name__ == "__main__":
     # Set up logging to look similar to bitcoin logs (UTC).
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ"
@@ -305,30 +536,4 @@ def main():
     logging.Formatter.converter = time.gmtime
     logger.setLevel(LOG_LEVEL)
 
-    # Handle SIGTERM gracefully.
-    signal.signal(signal.SIGTERM, sigterm_handler)
-
-    # Start up the server to expose the metrics.
-    start_http_server(METRICS_PORT)
-    while True:
-        process_start = datetime.now()
-
-        # Allow riprova.MaxRetriesExceeded and unknown exceptions to crash the process.
-        try:
-            refresh_metrics()
-        except riprova.exceptions.RetryError as e:
-            logger.error("Refresh failed during retry. Cause: " + str(e))
-            exception_count(e)
-        except json.decoder.JSONDecodeError as e:
-            logger.error("RPC call did not return JSON. Bad credentials? " + str(e))
-            sys.exit(1)
-
-        duration = datetime.now() - process_start
-        PROCESS_TIME.inc(duration.total_seconds())
-        logger.info("Refresh took %s seconds, sleeping for %s seconds", duration, REFRESH_SECONDS)
-
-        time.sleep(REFRESH_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+    main_task = asyncio.run(main())

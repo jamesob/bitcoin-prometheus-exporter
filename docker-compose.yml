@@ -3,6 +3,8 @@ services:
   bitcoind:
     # DO NOT USE THIS IMAGE EXCEPT FOR TESTING!
     image: jvstein/bitcoin-test-node:latest
+    ports:
+      - "8332:8332"
     command:
       - bitcoind
       - -printtoconsole
