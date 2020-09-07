@@ -194,6 +194,7 @@ def bitcoinrpc(*args) -> RpcResult:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("RPC call: " + " ".join(str(a) for a in args))
     rpc_result = rpc_client().call(*args)
+    logger.debug("Result:   %s", rpc_result)
     return rpc_result
 
 
