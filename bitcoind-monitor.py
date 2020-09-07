@@ -329,7 +329,8 @@ def make_set_smartfee(num_blocks: int) -> RpcCallback:
 
 def build_metric_collection() -> MetricCollection:
     """
-    Builds the collection of metrics, which is defined as a
+    Builds the collection of metrics, which is defined as a collection of RPC call arguments and
+    the callbacks to perform on a valid response.
     """
     calls: MetricCollection = [
         (("uptime",), [set_uptime]),
